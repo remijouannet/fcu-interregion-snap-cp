@@ -1,0 +1,357 @@
+#!/usr/bin/env python
+#
+# Copyright 2016 Outscale SAS
+#
+# copy a snapshot from one region to another, 
+# requires: boto (2.x),paramiko
+# warning: on eu-west-1 you need boto <= 2.33
+#
+
+import warnings
+warnings.filterwarnings('ignore',category=DeprecationWarning)
+import sys
+import boto
+from boto.ec2 import EC2Connection
+from boto.ec2.regioninfo import EC2RegionInfo
+import argparse
+import os
+from time import sleep
+from time import time
+import paramiko
+
+#regions definitions:
+#   omi -> valid omi id (centos 7)
+#   iops -> max iops
+#   iopsfact -> iops/giga
+regions = {
+    'eu-west-1': {'omi': 'ami-a4e5e1ed', 'iops': 2000, 'iopsfact': 10},
+    'eu-west-2': {'omi': 'ami-0175d923', 'iops': 4000, 'iopsfact': 30}
+}
+
+# destroy existing object
+def cleanup():
+    if vmdst:
+        vmdst.terminate()
+        while vmdst.state != 'terminated':
+            sleep(5)
+            vmdst.update()
+        if voldst:
+            voldst.delete()
+    if sgdst:
+        sgdst.delete()
+    if keydst:
+        if os.path.exists('%s.pem' % keydst.name):
+            os.unlink('%s.pem' % keydst.name)
+        keydst.delete()
+    if vmsrc:
+        vmsrc.terminate()
+        while vmsrc.state != 'terminated':
+            sleep(5)
+            vmsrc.update()
+        for v in vol:
+            v.delete()
+    if keysrc:
+        if os.path.exists('%s.pem' % keysrc.name):
+            os.unlink('%s.pem' % keysrc.name)
+        keysrc.delete()
+    if sgsrc:
+        sgsrc.delete()
+
+# read arguments
+parser = argparse.ArgumentParser(description='copy snapshot from region-src to region-dst')
+parser.add_argument('--ak-src', action='store', required=True, help='access key in source region')
+parser.add_argument('--sk-src', action='store', required=True, help='secret key in source region')
+parser.add_argument('--region-src',action='store', required=True, help='source region')
+parser.add_argument('--ak-dst', action='store', required=True, help='access key in destination region')
+parser.add_argument('--sk-dst', action='store', required=True, help='secret key in destination region')
+parser.add_argument('--region-dst',action='store', required=True, help='destination region')
+parser.add_argument('--snap-id', action='store', required=True, help='id of snapshot')
+parser.add_argument('--my-ip',action='store',required=True, help='public address ip of machine running this scripts')
+parser.add_argument('--no-compress',action='store_true',default=False, help="don't compress data")
+parser.add_argument('--disk',action='store',default=2, help="number of disk used on source",type=int)
+
+args = parser.parse_args()
+# check arguments
+if not args.region_src in regions:
+    print "unknown region source"
+    print "edit the regions definitions to use this region"
+    exit(1)
+
+if not args.region_dst in regions:
+    print "unknown region destination" 
+    print "edit the regions definitions to use this region"
+    exit(1)
+
+if args.region_src == args.region_dst:
+    print "region source and destination must be different"
+    exit(1)
+
+if args.disk > 8 :
+    print "max disk : 8"
+    exit(1)
+
+ncpud=args.disk
+ramd=args.disk+1
+if args.no_compress:
+    ncpus=args.disk
+    rams=args.disk+1
+else:
+    ncpus=args.disk*4
+    rams=args.disk*2+1
+if ncpus > 16:
+    ncpus=16
+if rams > 16:
+    rams=16
+
+# connect to src region an dst region
+try:
+    connsrc = EC2Connection(aws_access_key_id=args.ak_src, aws_secret_access_key=args.sk_src,
+                            region=EC2RegionInfo(name=args.region_src,endpoint='fcu.%s.outscale.com' % args.region_src))
+except:
+    print "ERROR: can't connect to %s", args.region_src
+    exit(1)
+
+try:
+    conndst = EC2Connection(aws_access_key_id=args.ak_dst, aws_secret_access_key=args.sk_dst,
+                            region=EC2RegionInfo(name=args.region_dst,endpoint='fcu.%s.outscale.com' % args.region_dst))
+except:
+    print "ERROR: can't connect to %s", args.region_dst
+    exit(1)
+
+# get snapshot
+snapshots = connsrc.get_all_snapshots(snapshot_ids=[args.snap_id])
+if len(snapshots) > 0:
+    snapshot = snapshots[0]
+else:
+    print "ERROR: snapshot %s not found" % args.snap_id
+    exit(1)
+
+# init global variables for cleanup()
+vmsrc = None
+keysrc = None
+sgsrc = None
+vmdst = None
+keydst = None
+sgdst = None
+voldst = None
+vol = []
+
+# check if omi are available
+try:
+    omisrc = connsrc.get_all_images(image_ids=[regions[args.region_src]['omi']])[0]
+except:
+    omisrc = None
+if omisrc is None:
+    print "Error: omi %s is not available in %s" % (regions[args.region_src]['omi'],args.region_src)
+    print "check and update region definition"
+    exit(1)
+
+try:
+    omidst = conndst.get_all_images(image_ids=[regions[args.region_dst]['omi']])[0]
+except:
+    omidst = None
+if omidst is None:
+    print "Error: omi %s is not available in %s" % (regions[args.region_dst]['omi'],args.region_dst)
+    print "check and update region definition"
+    exit(1)
+
+# create a vm in src region
+# with a temporary key and a temporary security group
+keyname = 'temp_src_key_%s' % snapshot.id
+sgname = 'temp_sg_%s' % snapshot.id
+try:
+    keytmp = connsrc.get_key_pair(keyname)
+except:
+    keytmp = None
+if keytmp:
+    # we cannot reuse an existing key, because private key may be lost
+    print "ERROR: keypair %s already exists in %s" % (keyname,args.region_src)
+    exit (1)
+
+keysrc = connsrc.create_key_pair(keyname)
+if os.path.exists('%s.pem' % keysrc.name):
+    os.unlink('%s.pem' % keysrc.name)
+# save key in current directory
+keysrc.save('')
+try:
+    sgtmp = connsrc.get_all_security_groups(groupnames=[sgname])[0]
+except:
+    sgtmp = None
+if sgtmp:
+    cleanup()
+    print "ERROR: security group %s already exists in %s" % (sgname,args.region_src)
+    exit(1)
+
+sgsrc = connsrc.create_security_group(sgname, 'security group for copy snapshot %s' % snapshot.id)
+# authorize only ssh connection from my_ip to vmsrc
+sgsrc.authorize(ip_protocol='tcp',from_port=22,to_port=22,cidr_ip=args.my_ip)
+sgsrc.authorize(ip_protocol='icmp',from_port=-1,to_port=-1,cidr_ip=args.my_ip)
+try:
+    vm = connsrc.run_instances(omisrc.id,key_name=keysrc.name,security_groups=[sgsrc.id],instance_type='tina.c%ir%i' % (ncpus,rams))
+except:
+    exc_type, exc_value, exc_traceback = sys.exc_info()
+    print exc_value
+    vm = None
+else:
+    vmsrc = vm.instances[0]
+    vmsrc.add_tag('Name','temp_src_vm_%s' % snapshot.id)
+if vm is None:
+    cleanup()
+    print "ERROR: can't create source vm"
+    exit(1)
+
+while vmsrc.state != 'running':
+    sleep(5)
+    vmsrc.update()
+dev=['b','c','d','e','f','g','h','i']
+for i in range(0,args.disk):
+    iops = snapshot.volume_size*regions[args.region_src]['iopsfact']
+    if iops > regions[args.region_src]['iops']:
+        iops = regions[args.region_src]['iops']
+    try:
+        v = connsrc.create_volume(snapshot.volume_size,'%sa' % args.region_src,snapshot=snapshot.id,volume_type='io1',iops=iops)
+    except:
+        v = None
+    if v:
+        v.add_tag('Name','temp_src_vol_%s' % snapshot.id)
+        vol.append(v)
+    else:
+        cleanup()
+        print "ERROR: can't create volume for source vm"
+        exit(1)
+    while vol[i].status != 'available':
+        sleep(5)
+        vol[i].update()
+    vol[i].attach(vmsrc.id,'/dev/sd%c' % dev[i])
+
+# create a vm in dst region
+keyname = 'temp_dst_key_%s' % snapshot.id
+try:
+    keytmp = conndst.get_key_pair(keyname)
+except:
+    keytmp = None
+if keytmp:
+    cleanup()
+    print "ERROR: keypair %s already exists in %s" % (keyname,args.region_dst)
+    exit(1)
+
+keydst = conndst.create_key_pair(keyname)
+if os.path.exists('%s.pem' % keydst.name):
+    os.unlink('%s.pem' % keydst.name)
+keydst.save('')
+try:
+    sgtmp = conndst.get_all_security_groups(groupnames=[sgname])[0]
+except:
+    sgtmp = None
+if sgtmp:
+    cleanup()
+    print "ERROR: security group %s already exists in %s" % (sgname,args.region_dst)
+
+sgdst = conndst.create_security_group(sgname, 'security group for copy snapshot %s' % snapshot.id)
+# authorize ssh connection from my_ip and vmsrc to vmdst
+sgdst.authorize(ip_protocol='tcp',from_port=22,to_port=22,cidr_ip=vmsrc.ip_address)
+sgdst.authorize(ip_protocol='tcp',from_port=22,to_port=22,cidr_ip=args.my_ip)
+sgdst.authorize(ip_protocol='icmp',from_port=-1,to_port=-1,cidr_ip=args.my_ip)
+try:
+    vm = conndst.run_instances(omidst.id,key_name=keydst.name,security_groups=[sgdst.id],instance_type='tina.c%ir%i' % (ncpud,ramd))
+except:
+    exc_type, exc_value, exc_traceback = sys.exc_info()
+    print exc_value
+    vm = None
+else:
+    vmdst = vm.instances[0]
+    vmdst.add_tag('Name','temp_dst_vm_%s' % snapshot.id)
+if vm is None:
+    cleanup()
+    print "ERROR: can't create destination vm"
+    exit(1)
+
+while vmdst.state != 'running':
+    sleep(5)
+    vmdst.update()
+iops = snapshot.volume_size*regions[args.region_dst]['iopsfact']
+if iops > regions[args.region_dst]['iops']:
+    iops = regions[args.region_dst]['iops']
+try:
+    voldst = conndst.create_volume(snapshot.volume_size,'%sa' % args.region_dst,volume_type='io1',iops=iops)
+except:
+    voldst = None
+if voldst is None:
+    cleanup()
+    print "ERROR: can't create destination volume"
+    exit(1)
+
+voldst.add_tag('Name','temp_dst_vol_%s' % snapshot.id)
+while voldst.status != 'available':
+    sleep(5)
+    voldst.update()
+voldst.attach(vmdst.id,'/dev/sdb')
+
+# with for fw update
+ping1=256
+ping2=256
+while ping1 and ping2:
+    ping1 = os.system('ping -n -q -c 1 %s >/dev/null' % vmsrc.ip_address)
+    ping2 = os.system('ping -n -q -c 1 %s >/dev/null' % vmdst.ip_address)
+sleep(10)
+
+# now we can copy snapshot
+sshclient = paramiko.client.SSHClient()
+sshclient.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+try:
+    sshclient.connect(vmdst.ip_address,port=22,username='root',key_filename='%s.pem' % keydst.name)
+except:
+    cleanup()
+    print "ERROR: can't connect to destination vm"
+    exit(1)
+
+# install lbizp2 on dest vm
+if not args.no_compress:
+    (stdin,stdout,stderr) = sshclient.exec_command('yum install -y lbzip2')
+    exit_status = stdout.channel.recv_exit_status()
+# get device name on dest vm
+(stdin,stdout,stderr) = sshclient.exec_command('ls /dev/*vdb')
+res = stdout.readlines()
+sshclient.close()
+dstdev = res[0].strip()
+
+# transfert ssh key in src vm
+try:
+    sshclient.connect(vmsrc.ip_address,port=22,username='root',key_filename='%s.pem' % keysrc.name)
+except:
+    cleanup()
+    print "ERROR: can't connect to source vm"
+    exit(1)
+
+ftp = sshclient.open_sftp()
+ftp.put('%s.pem' % keydst.name,'/root/.ssh/dest.pem')
+ftp.chmod('/root/.ssh/dest.pem',0600)
+# put copy script in source vm
+if args.no_compress:
+    ftp.put('copyblock_nc.sh','/root/copyblock.sh')
+else:
+    ftp.put('copyblock.sh','/root/copyblock.sh')
+ftp.chmod('/root/copyblock.sh',0755)
+ftp.close()
+
+if not args.no_compress:
+    (stdin,stdout,stderr) = sshclient.exec_command('yum install -y lbzip2')
+    exit_status = stdout.channel.recv_exit_status()
+
+copy_begin=time()
+(stdin,stdout,stderr) = sshclient.exec_command('for i in {0..%i} ; do echo $i ; done | xargs -n 1 -P %i /root/copyblock.sh %s %s 1024' % (snapshot.volume_size-1,args.disk,vmdst.ip_address,dstdev))
+exit_status = stdout.channel.recv_exit_status()
+res = stdout.readlines()
+res2 = stderr.readlines()
+sshclient.close()
+copy_end=time()
+print "time copy: %i" % int(copy_end-copy_begin)
+
+# create snapshot on destination
+snapdst = voldst.create_snapshot(description='copy of snapshot %s (from %s)' % (snapshot.id,args.region_src))
+
+print "snapshot id: %s" % snapdst.id
+
+# clean objects
+cleanup()
+

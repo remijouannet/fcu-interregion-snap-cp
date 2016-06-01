@@ -1,0 +1,3 @@
+boto==2.33
+paramiko
+
